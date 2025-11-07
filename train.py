@@ -1,4 +1,3 @@
-# train.py
 import argparse
 import os
 import os.path as op
@@ -6,7 +5,6 @@ import time
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.amp import autocast, GradScaler
 
 from datasets import build_dataloader
 from model import build_model
@@ -19,11 +17,8 @@ from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 
 
-# ----------------------------
-# CLI
-# ----------------------------
 def build_parser():
-    parser = argparse.ArgumentParser(description="ReID5o Training Script (auto log dir under log/)")
+    parser = argparse.ArgumentParser(description="ReID5o Training Script")
     parser.add_argument(
         "--config_file",
         type=str,
@@ -55,30 +50,28 @@ def parse_arguments():
     return args, parser
 
 
-# ----------------------------
-# Utils
-# ----------------------------
-def allocate_run_dir(base_dir: str = "log") -> str:
-    """
-    Create and return the first non-existing numbered directory under base_dir.
-    i.e., log/0, log/1, ...  The first gap will be created and returned.
-    """
-    os.makedirs(base_dir, exist_ok=True)
-    i = 0
-    while True:
-        cand = op.join(base_dir, str(i))
-        if not op.exists(cand):
-            os.makedirs(cand, exist_ok=False)
-            return cand
-        i += 1
-
-
 def setup_environment(args):
     os.makedirs(args.output_dir, exist_ok=True)
     logger = setup_logger("ORBench", save_dir=args.output_dir, if_train=args.training)
     logger.info("Using device: %s", "cuda" if torch.cuda.is_available() else "cpu")
     logger.info(args)
     return logger
+
+
+def freeze_vision_backbone(model):
+    modules_to_freeze = [
+        "vision_encoder",
+        "rgb_tokenizer",
+        "nir_tokenizer",
+        "cp_tokenizer",
+        "sk_tokenizer",
+    ]
+    for module_name in modules_to_freeze:
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad = False
 
 
 def move_batch_to_device(batch, device):
@@ -121,17 +114,17 @@ def build_query_loader_dict(loaders):
         sk_nir_cp_query_loader,
         nir_cp_text_query_loader,
         cp_nir_text_query_loader,
-        text_nir_cp_text_query_loader,
+        text_nir_cp_query_loader,
         nir_sk_text_query_loader,
         sk_nir_text_query_loader,
-        text_nir_sk_text_query_loader,
+        text_nir_sk_query_loader,
         cp_sk_text_query_loader,
         sk_cp_text_query_loader,
-        text_cp_sk_text_query_loader,
+        text_cp_sk_query_loader,
         nir_cp_sk_text_query_loader,
         cp_nir_sk_text_query_loader,
         sk_nir_cp_text_query_loader,
-        text_nir_cp_sk_text_query_loader,
+        text_nir_cp_sk_query_loader,
         num_classes,
     ) = loaders
 
@@ -157,49 +150,88 @@ def build_query_loader_dict(loaders):
         "sk_nir_cp_query_loader": sk_nir_cp_query_loader,
         "nir_cp_text_query_loader": nir_cp_text_query_loader,
         "cp_nir_text_query_loader": cp_nir_text_query_loader,
-        "text_nir_cp_text_query_loader": text_nir_cp_text_query_loader,
+        "text_nir_cp_query_loader": text_nir_cp_query_loader,
         "nir_sk_text_query_loader": nir_sk_text_query_loader,
         "sk_nir_text_query_loader": sk_nir_text_query_loader,
-        "text_nir_sk_text_query_loader": text_nir_sk_text_query_loader,
+        "text_nir_sk_query_loader": text_nir_sk_query_loader,
         "cp_sk_text_query_loader": cp_sk_text_query_loader,
         "sk_cp_text_query_loader": sk_cp_text_query_loader,
-        "text_cp_sk_text_query_loader": text_cp_sk_text_query_loader,
+        "text_cp_sk_query_loader": text_cp_sk_query_loader,
         "nir_cp_sk_text_query_loader": nir_cp_sk_text_query_loader,
         "cp_nir_sk_text_query_loader": cp_nir_sk_text_query_loader,
         "sk_nir_cp_text_query_loader": sk_nir_cp_text_query_loader,
-        "text_nir_cp_sk_text_query_loader": text_nir_cp_sk_text_query_loader,
+        "text_nir_cp_sk_query_loader": text_nir_cp_sk_query_loader,
     }
 
     return train_loader, test_gallery_loader, query_loaders, num_classes
 
 
-def run_evaluation(model, evaluator, epoch, logger, device):
+def run_evaluation(model, evaluator, epoch, logger):
     logger.info("Start evaluating at epoch %d", epoch)
-    model.eval()
-    with torch.no_grad():
-        top1 = evaluator.eval(model)
+    top1 = evaluator.eval(model.eval())
     logger.info("Evaluation finished: Top-1 Average = %.3f", top1)
     model.train()
     return top1
 
 
-# ----------------------------
-# Train / Eval
-# ----------------------------
+def resolve_amp_settings(args, logger):
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    default_use_amp = device_type == "cuda"
+    use_amp = bool(getattr(args, "use_amp", default_use_amp)) and device_type == "cuda"
+    if bool(getattr(args, "use_amp", None)) is False and default_use_amp and not use_amp:
+        logger.info("AMP disabled by configuration.")
+    if not torch.cuda.is_available() and getattr(args, "use_amp", False):
+        logger.warning("AMP requested but CUDA is unavailable. Disabling AMP.")
+    amp_dtype_str = getattr(args, "amp_dtype", "fp16").lower()
+    amp_dtype = torch.bfloat16 if amp_dtype_str == "bf16" else torch.float16
+    scaler = None
+    if use_amp and amp_dtype == torch.float16:
+        scaler = torch.amp.GradScaler("cuda")
+    autocast_factory = (
+        (lambda: torch.amp.autocast("cuda", dtype=amp_dtype))
+        if use_amp
+        else nullcontext
+    )
+    return use_amp, amp_dtype_str, scaler, autocast_factory
+
+
+def ensure_fp32_trainable_params(model, logger):
+    fp16_params = [
+        name
+        for name, param in model.named_parameters()
+        if param.requires_grad and param.dtype == torch.float16
+    ]
+    if fp16_params:
+        logger.info(
+            "Casting %d trainable parameters from FP16 to FP32 for stable optimization.",
+            len(fp16_params),
+        )
+        model.float()
+    return model
+
+
 def do_train(args, logger):
-    # dataloaders
     loaders = build_dataloader(args)
     train_loader, test_gallery_loader, query_loaders, num_classes = build_query_loader_dict(loaders)
 
-    # model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(args, num_classes=num_classes).to(device)
+    model = build_model(args, num_classes=num_classes)
+    model = ensure_fp32_trainable_params(model, logger)
+    model.to(device)
 
-    # optimizer / scheduler
+    if getattr(args, "freeze_vision_encoder", False):
+        freeze_vision_backbone(model)
+        logger.info("Frozen vision encoder parameters as requested in config.")
+
     optimizer = build_optimizer(args, model)
     scheduler = build_lr_scheduler(args, optimizer)
 
-    # ckpt manager
+    use_amp, amp_dtype_str, scaler, autocast_factory = resolve_amp_settings(args, logger)
+    args.use_amp = use_amp
+    args.amp_dtype = amp_dtype_str
+    if use_amp:
+        logger.info("AMP enabled with %s precision.", amp_dtype_str.upper())
+
     checkpointer = Checkpointer(
         model,
         optimizer=optimizer,
@@ -212,7 +244,6 @@ def do_train(args, logger):
     start_epoch = 0
     best_top1 = 0.0
 
-    # resume logic
     resume_ckpt = None
     if args.resume_ckpt_file:
         resume_ckpt = args.resume_ckpt_file
@@ -236,27 +267,23 @@ def do_train(args, logger):
     loss_meter = AverageMeter()
     model.train()
 
-    # AMP (autocast only if CUDA available)
-    use_amp = torch.cuda.is_available()
-    autocast_ctx = autocast if use_amp else nullcontext
-    scaler = GradScaler(enabled=use_amp)
-
     for epoch in range(start_epoch, args.num_epoch):
         epoch_start = time.time()
         loss_meter.reset()
 
         for iteration, batch in enumerate(train_loader, 1):
             batch = move_batch_to_device(batch, device)
-            optimizer.zero_grad(set_to_none=True)
 
-            with autocast_ctx(dtype=torch.float16):
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_factory():
                 loss_dict = model(batch)
+
                 losses = [value for key, value in loss_dict.items() if "loss" in key]
                 if not losses:
                     continue
                 total_loss = torch.stack(losses).sum()
 
-            if use_amp:
+            if scaler is not None:
                 scaler.scale(total_loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -264,7 +291,7 @@ def do_train(args, logger):
                 total_loss.backward()
                 optimizer.step()
 
-            loss_meter.update(total_loss.item(), batch["pids"].size(0))
+            loss_meter.update(total_loss.detach().item(), batch["pids"].size(0))
 
             if iteration % args.log_period == 0:
                 reduced_losses = reduce_loss_dict(loss_dict)
@@ -283,25 +310,21 @@ def do_train(args, logger):
                     current_lr,
                 )
 
-        # epoch end
         scheduler.step()
         epoch_time = time.time() - epoch_start
         logger.info("Epoch %d finished in %.2f seconds", epoch + 1, epoch_time)
 
-        # evaluation schedule
         should_eval = args.eval_period == -1 or (
             args.eval_period > 0 and (epoch + 1) % args.eval_period == 0
         )
         if should_eval:
-            top1 = run_evaluation(model, evaluator, epoch + 1, logger, device)
+            top1 = run_evaluation(model, evaluator, epoch + 1, logger)
         else:
             top1 = -1
 
-        # save last
         checkpoint_data = {"epoch": epoch + 1, "best_top1": best_top1}
         checkpointer.save("last", **checkpoint_data)
 
-        # save best
         if top1 > best_top1:
             best_top1 = top1
             checkpoint_data["best_top1"] = best_top1
@@ -328,10 +351,10 @@ def main():
             cfg.__dict__[key] = value
 
     cfg.training = not getattr(cli_args, "eval_only", False)
-
-    # === Auto allocate output dir under log/ on each training run ===
-    if cfg.training:
-        cfg.output_dir = allocate_run_dir(base_dir="logs")
+    if not hasattr(cfg, "use_amp"):
+        cfg.use_amp = torch.cuda.is_available()
+    if not hasattr(cfg, "amp_dtype"):
+        cfg.amp_dtype = "fp16"
 
     logger = setup_environment(cfg)
     save_train_configs(cfg.output_dir, argparse.Namespace(**dict(cfg)))
@@ -361,7 +384,7 @@ def main():
             get_mAP=True,
             **query_loaders,
         )
-        run_evaluation(model, evaluator, 0, logger, device)
+        run_evaluation(model, evaluator, 0, logger)
         return
 
     do_train(cfg, logger)
