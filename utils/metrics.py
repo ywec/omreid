@@ -339,9 +339,12 @@ class Evaluator:
         """所有模态组合统一先走 mm_generation，再通过 rgb_center 查询进入 mm_fusion。"""
 
         model = model.eval()
-        model_param = next(model.parameters())
-        device = model_param.device
-        model_dtype = model_param.dtype
+        # 使用生成与融合模块自身的 dtype / device，避免混精度下参数与输入不匹配
+        mge_param = next(model.mm_generation.parameters())
+        mfu_param = next(model.mm_fusion.parameters())
+        device = mge_param.device
+        mge_dtype = mge_param.dtype
+        mfu_dtype = mfu_param.dtype
         qids, qfeats = [], []
 
         num_modalities = len(modalities)
@@ -376,10 +379,12 @@ class Evaluator:
 
                     if modality == "text":
                         txt_cls, txt_tokens = encoder_method(imgs[i])
-                        mge_kwargs["txt_patches"] = txt_tokens.to(model_dtype)
-                        mge_kwargs["txt_cls"] = txt_cls.to(model_dtype)
+                        mge_kwargs["txt_patches"] = txt_tokens.to(
+                            device=device, dtype=mge_dtype
+                        )
+                        mge_kwargs["txt_cls"] = txt_cls.to(device=device, dtype=mge_dtype)
                     else:
-                        tokens = encoder_method(imgs[i]).to(model_dtype)
+                        tokens = encoder_method(imgs[i]).to(device=device, dtype=mge_dtype)
                         mge_kwargs[f"{modality}_patches"] = tokens[:, 1:, :]
                         mge_kwargs[f"{modality}_cls"] = tokens[:, 0, :]
 
@@ -388,7 +393,9 @@ class Evaluator:
                 # build_v1 规定使用 rgb_center 作为融合查询
                 batch_size = pid.shape[0] if pid.ndim > 0 else 1
                 rgb_query = (
-                    model.rgb_center.to(device, dtype=model_dtype).expand(batch_size, -1)
+                    model.rgb_center.to(device=device, dtype=mfu_dtype).expand(
+                        batch_size, -1
+                    )
                 )
 
                 fusion_feats = model.mm_fusion(
@@ -557,7 +564,9 @@ class Evaluator:
 
     def eval(self, model):
         model = model.eval()
-        device = next(model.parameters()).device
+        fusion_param = next(model.mm_fusion.parameters())
+        device = fusion_param.device
+        fusion_dtype = fusion_param.dtype
 
         # 1) 提前抽取 gallery 特征，后续检索直接矩阵相似度
         gids, gfeats = [], []
@@ -565,6 +574,7 @@ class Evaluator:
             img = img.to(device)
             with torch.no_grad():
                 img_feat = model.encode_rgb_cls(img)
+                img_feat = img_feat.to(device=device, dtype=fusion_dtype)
             gids.append(pid.view(-1))
             gfeats.append(img_feat)
         gids = torch.cat(gids, 0)
