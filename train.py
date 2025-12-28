@@ -7,7 +7,7 @@ from contextlib import nullcontext
 import torch
 
 from datasets import build_dataloader
-from model import build_model
+from model import build_model_v1
 from solver import build_optimizer, build_lr_scheduler
 from utils.checkpoint import Checkpointer
 from utils.comm import is_main_process, reduce_dict
@@ -215,7 +215,7 @@ def do_train(args, logger):
     train_loader, test_gallery_loader, query_loaders, num_classes = build_query_loader_dict(loaders)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(args, num_classes=num_classes)
+    model = build_model_v1(args, num_classes=num_classes)
     model = ensure_fp32_trainable_params(model, logger)
     model.to(device)
 
@@ -363,7 +363,7 @@ def main():
         cfg.training = False
         loaders = build_dataloader(cfg)
         _, test_gallery_loader, query_loaders, num_classes = build_query_loader_dict(loaders)
-        model = build_model(cfg, num_classes=num_classes)
+        model = build_model_v1(cfg, num_classes=num_classes)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
 
@@ -392,3 +392,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
