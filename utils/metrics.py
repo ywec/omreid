@@ -335,13 +335,30 @@ class Evaluator:
             "text": "encode_text_embeds",
         }
 
+    def _get_first_param(self, model, *module_names):
+        """Get the first parameter from available modules for dtype/device hints."""
+
+        for name in module_names:
+            module = getattr(model, name, None)
+            if module is None:
+                continue
+            try:
+                return next(module.parameters())
+            except (TypeError, StopIteration):
+                continue
+
+        raise AttributeError(
+            f"None of the modules {module_names} on model '{type(model)}' expose parameters."
+        )
+
     def _extract_fused_features(self, model, loader, modalities):
         """所有模态组合统一先走 mm_generation，再通过 rgb_center 查询进入 mm_fusion。"""
 
         model = model.eval()
         # 使用生成与融合模块自身的 dtype / device，避免混精度下参数与输入不匹配
-        mge_param = next(model.mm_generation.parameters())
-        mfu_param = next(model.mm_fusion.parameters())
+        mge_param = self._get_first_param(model, "mm_generation")
+        # build_v1 使用 modal_moe 作为融合模块，build 使用 mm_fusion（nn.Module）
+        mfu_param = self._get_first_param(model, "mm_fusion", "modal_moe")
         device = mge_param.device
         mge_dtype = mge_param.dtype
         mfu_dtype = mfu_param.dtype
@@ -564,7 +581,7 @@ class Evaluator:
 
     def eval(self, model):
         model = model.eval()
-        fusion_param = next(model.mm_fusion.parameters())
+        fusion_param = self._get_first_param(model, "mm_fusion", "modal_moe")
         device = fusion_param.device
         fusion_dtype = fusion_param.dtype
 
